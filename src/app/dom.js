@@ -1,0 +1,9 @@
+export const main = document.querySelector("#main");
+export const tabs = document.querySelector("#tabs");
+export const message = document.querySelector("#message");
+export const systemSummary = document.querySelector("#system-summary");
+export const sessionPanel = document.querySelector("#session-panel");
+export const notificationCount = document.querySelector("#notification-count");
+export const auditCount = document.querySelector("#audit-count");
+export const notificationList = document.querySelector("#notifications");
+export const auditLog = document.querySelector("#audit-log");

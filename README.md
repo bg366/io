@@ -10,6 +10,15 @@ SZRZ is a proof of concept for handling complaints (`REKLAMACJA`) and returns (`
 - Database target: SQLite, configured with the `SZRZ_DB` environment variable.
 - API tests: Python `unittest` using `http.client`, `subprocess`, `tempfile`, and JSON.
 
+## Project Structure
+
+- `server.py` - backend entrypoint.
+- `szrz/` - Python backend modules: settings, DB/schema/seed data, auth, repository serializers, business services, and HTTP routing.
+- `src/app.js` - frontend entrypoint.
+- `src/app/` - frontend modules: API client, state, normalization, constants, DOM references, actions, and render modules.
+- `src/domain.js` - compatibility facade for domain tests.
+- `src/domain/` - pure JavaScript domain logic split into constants, case workflows, admin/reporting, demo data, helpers, and errors.
+
 ## Run
 
 Start the backend API:
