@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SZRZ PoC - reklamacje i zwroty</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">SZRZ PoC</p>
+          <h1>Reklamacje i zwroty</h1>
+        </div>
+        <div id="system-summary" class="system-summary" aria-live="polite"></div>
+      </header>
+
+      <nav id="tabs" class="tabs" aria-label="Widoki aplikacji">
+        <button type="button" data-tab="client">Klient</button>
+        <button type="button" data-tab="status">Status publiczny</button>
+        <button type="button" data-tab="employee">Pracownik</button>
+        <button type="button" data-tab="manager">Kierownik</button>
+        <button type="button" data-tab="admin">Admin</button>
+      </nav>
+
+      <div id="message" class="message" role="status" aria-live="polite" hidden></div>
+
+      <main id="main" class="workspace"></main>
+
+      <section class="ops-grid" aria-label="Dzienniki operacyjne">
+        <section class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Outbox</p>
+              <h2>Powiadomienia</h2>
+            </div>
+            <span id="notification-count" class="counter">0</span>
+          </div>
+          <div id="notifications"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Audit</p>
+              <h2>Dziennik zmian</h2>
+            </div>
+            <span id="audit-count" class="counter">0</span>
+          </div>
+          <div id="audit-log"></div>
+        </section>
+      </section>
+    </div>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>
