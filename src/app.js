@@ -1,25 +1,72 @@
-import {
-  CASE_TYPES,
-  CHANNELS,
-  DECISION_TYPES,
-  FINAL_STATUSES,
-  ROLES,
-  STATUSES,
-  createCase,
-  createDecision,
-  createDemoState,
-  confirmWmsReceipt,
-  escalateCase,
-  evaluateDeadlines,
-  generateReport,
-  generateReturnLabel,
-  lookupCase,
-  saveUser,
-  updateConfiguration,
-  updateStatus,
-} from "./domain.js";
+const TOKEN_KEY = "szrz-poc-api-token-v1";
 
-const STORAGE_KEY = "szrz-poc-state-v1";
+const CASE_TYPES = Object.freeze({
+  COMPLAINT: "REKLAMACJA",
+  RETURN: "ZWROT",
+});
+
+const CHANNELS = Object.freeze({
+  ONLINE: "ONLINE",
+  EMAIL: "EMAIL",
+  PHONE: "TELEFON",
+  IN_PERSON: "OSOBISCIE",
+});
+
+const STATUSES = Object.freeze({
+  NEW: "NOWE",
+  IN_PROGRESS: "W_TRAKCIE",
+  WAITING_FOR_GOODS: "OCZEKUJE_NA_TOWAR",
+  DECIDED: "ROZPATRZONE",
+  CLOSED: "ZAMKNIETE",
+  ESCALATED: "ESKALOWANE",
+});
+
+const DECISION_TYPES = Object.freeze({
+  REPAIR: "NAPRAWA",
+  REPLACE: "WYMIANA",
+  REFUND: "ZWROT_GOTOWKI",
+  PRICE_REDUCTION: "OBNIZENIE_CENY",
+  REJECT: "ODRZUCENIE",
+});
+
+const ROLES = Object.freeze({
+  CLIENT: "KLIENT",
+  EMPLOYEE: "PRACOWNIK_OBSLUGI",
+  MANAGER: "KIEROWNIK",
+  ADMIN: "ADMINISTRATOR",
+});
+
+const DEFAULT_CONFIG = Object.freeze({
+  complaintDeadlineDays: 30,
+  returnDeadlineDays: 14,
+  alertThresholdDays: 2,
+  staleEscalationDays: 5,
+});
+
+const FINAL_STATUSES = new Set([STATUSES.DECIDED, STATUSES.CLOSED]);
+
+const demoAccounts = [
+  {
+    label: "Klient",
+    email: "client@example.com",
+    password: "demo123",
+  },
+  {
+    label: "Pracownik",
+    email: "marta.ops@example.com",
+    password: "demo123",
+  },
+  {
+    label: "Kierownik",
+    email: "tomasz.manager@example.com",
+    password: "demo123",
+  },
+  {
+    label: "Admin",
+    email: "ewa.admin@example.com",
+    password: "demo123",
+  },
+];
 
 const labels = {
   [CASE_TYPES.COMPLAINT]: "Reklamacja",
@@ -51,6 +98,7 @@ const ui = {
   editingUserId: null,
   lookup: null,
   message: null,
+  loading: true,
   employeeFilters: {
     query: "",
     status: "",
@@ -63,25 +111,48 @@ const ui = {
     status: "",
     category: "",
   },
+  report: null,
 };
 
-let state = loadState();
-ui.selectedCaseId = state.cases[0]?.id || null;
+let state = emptyBootstrap();
+const session = {
+  token: localStorage.getItem(TOKEN_KEY) || "",
+  user: null,
+};
 
 const main = document.querySelector("#main");
 const tabs = document.querySelector("#tabs");
 const message = document.querySelector("#message");
 const systemSummary = document.querySelector("#system-summary");
+const sessionPanel = document.querySelector("#session-panel");
 const notificationCount = document.querySelector("#notification-count");
 const auditCount = document.querySelector("#audit-count");
 const notificationList = document.querySelector("#notifications");
 const auditLog = document.querySelector("#audit-log");
 
-document.addEventListener("DOMContentLoaded", render);
-document.body.addEventListener("click", handleClick);
-document.body.addEventListener("submit", handleSubmit);
+document.addEventListener("DOMContentLoaded", () => {
+  document.body.addEventListener("click", (event) => {
+    void handleClick(event);
+  });
+  document.body.addEventListener("submit", (event) => {
+    void handleSubmit(event);
+  });
+  void initialize();
+});
 
-function handleClick(event) {
+async function initialize() {
+  render();
+
+  await refreshBootstrap();
+
+  if (session.token) {
+    await loadCurrentUser();
+  }
+
+  render();
+}
+
+async function handleClick(event) {
   const tab = event.target.closest("[data-tab]");
   if (tab) {
     ui.activeTab = tab.dataset.tab;
@@ -93,7 +164,7 @@ function handleClick(event) {
   const action = event.target.closest("[data-action]");
   if (!action) return;
 
-  const { action: name, caseId, userId } = action.dataset;
+  const { action: name, caseId, userId, email, password } = action.dataset;
 
   if (name === "select-case") {
     ui.selectedCaseId = caseId;
@@ -101,26 +172,48 @@ function handleClick(event) {
     return;
   }
 
+  if (name === "demo-login") {
+    await login(email, password);
+    return;
+  }
+
+  if (name === "logout") {
+    clearSession();
+    setMessage("Wylogowano.", "success");
+    render();
+    return;
+  }
+
   if (name === "evaluate-deadlines") {
-    mutate(() => evaluateDeadlines(state), "Reguly terminow zostaly ocenione.");
+    await mutateRemote(
+      () => apiRequest("/api/deadlines/evaluate", { method: "POST", requireAuth: true }),
+      "Reguly terminow zostaly ocenione.",
+    );
     return;
   }
 
   if (name === "reset-demo") {
-    state = createDemoState();
-    ui.selectedCaseId = state.cases[0]?.id || null;
-    ui.lookup = null;
-    ui.editingUserId = null;
-    persistState();
-    setMessage("Przywrocono dane demonstracyjne.", "success");
-    render();
+    await mutateRemote(
+      () => apiRequest("/api/reset-demo", { method: "POST", requireAuth: true }),
+      "Przywrocono dane demonstracyjne.",
+      () => {
+        ui.lookup = null;
+        ui.editingUserId = null;
+        ui.report = null;
+      },
+    );
     return;
   }
 
   if (name === "generate-label") {
     const courier = document.querySelector("#label-courier")?.value || "InPost";
-    mutate(
-      () => generateReturnLabel(state, caseId, courier, actorFor(ROLES.EMPLOYEE)),
+    await mutateRemote(
+      () =>
+        apiRequest(`/api/cases/${encodeURIComponent(caseId)}/return-label`, {
+          method: "POST",
+          body: { courier },
+          requireAuth: true,
+        }),
       "Wygenerowano etykiete zwrotna.",
     );
     return;
@@ -128,7 +221,15 @@ function handleClick(event) {
 
   if (name === "wms-receipt") {
     const condition = document.querySelector("#wms-condition")?.value || "Towar kompletny";
-    mutate(() => confirmWmsReceipt(state, caseId, condition), "Mock WMS potwierdzil odbior.");
+    await mutateRemote(
+      () =>
+        apiRequest(`/api/cases/${encodeURIComponent(caseId)}/wms-receipt`, {
+          method: "POST",
+          body: { condition },
+          requireAuth: true,
+        }),
+      "Mock WMS potwierdzil odbior.",
+    );
     return;
   }
 
@@ -139,16 +240,18 @@ function handleClick(event) {
   }
 
   if (name === "toggle-user") {
-    const user = state.users.find((item) => item.id === userId);
-    if (!user) return;
-    mutate(
-      () => saveUser(state, { ...user, active: !user.active }, actorFor(ROLES.ADMIN)),
-      user.active ? "Uzytkownik zostal dezaktywowany." : "Uzytkownik zostal aktywowany.",
+    await mutateRemote(
+      () =>
+        apiRequest(`/api/users/${encodeURIComponent(userId)}/toggle`, {
+          method: "POST",
+          requireAuth: true,
+        }),
+      "Status uzytkownika zostal zmieniony.",
     );
   }
 }
 
-function handleSubmit(event) {
+async function handleSubmit(event) {
   const form = event.target;
   if (!(form instanceof HTMLFormElement)) return;
   event.preventDefault();
@@ -156,37 +259,56 @@ function handleSubmit(event) {
   const formId = form.getAttribute("id");
   const data = formData(form);
 
+  if (formId === "login-form") {
+    await login(data.email, data.password);
+    return;
+  }
+
   if (formId === "client-form") {
-    mutate(() => {
-      const result = createCase(state, data, actorFor(ROLES.CLIENT));
-      ui.lookup = {
-        case: result.case,
-        number: result.case.number,
-        email: result.case.email,
-      };
-      ui.selectedCaseId = result.case.id;
-      form.reset();
-      return result;
-    }, "Zgloszenie zostalo zarejestrowane.");
+    await mutateRemote(
+      async () => {
+        const result = await apiRequest("/api/cases", {
+          method: "POST",
+          body: casePayload(data),
+        });
+        const complaintCase = extractCase(result);
+        if (complaintCase) {
+          ui.lookup = {
+            case: normalizeCase(complaintCase),
+            number: complaintCase.number,
+            email: complaintCase.email || data.email,
+          };
+          ui.selectedCaseId = complaintCase.id;
+        }
+        form.reset();
+        return result;
+      },
+      "Zgloszenie zostalo zarejestrowane.",
+    );
     return;
   }
 
   if (formId === "lookup-form") {
-    const found = lookupCase(state, data.number, data.email);
-    ui.lookup = found
-      ? { case: found, number: data.number, email: data.email }
-      : { case: null, number: data.number, email: data.email };
-    setMessage(found ? "Odnaleziono status zgloszenia." : "Nie odnaleziono sprawy dla podanych danych.", found ? "success" : "error");
-    render();
+    await lookupPublicStatus(data.number, data.email);
     return;
   }
 
   if (formId === "employee-create-form") {
-    mutate(() => {
-      const result = createCase(state, data, actorFor(ROLES.EMPLOYEE));
-      ui.selectedCaseId = result.case.id;
-      return result;
-    }, "Zgloszenie obslugowe zostalo dodane.");
+    await mutateRemote(
+      async () => {
+        const result = await apiRequest("/api/cases", {
+          method: "POST",
+          body: casePayload(data),
+          requireAuth: true,
+        });
+        const complaintCase = extractCase(result);
+        if (complaintCase) {
+          ui.selectedCaseId = complaintCase.id;
+        }
+        return result;
+      },
+      "Zgloszenie obslugowe zostalo dodane.",
+    );
     return;
   }
 
@@ -196,42 +318,52 @@ function handleSubmit(event) {
       status: data.status || "",
       type: data.type || "",
     };
+    await loadCases(ui.employeeFilters);
+    setMessage("Kolejka spraw zostala odswiezona.", "success");
     render();
     return;
   }
 
   if (formId === "status-form") {
-    mutate(
+    await mutateRemote(
       () =>
-        updateStatus(
-          state,
-          data.caseId,
-          data.status,
-          actorFor(ROLES.EMPLOYEE),
-          data.comment,
-        ),
+        apiRequest(`/api/cases/${encodeURIComponent(data.caseId)}/status`, {
+          method: "PUT",
+          body: {
+            status: data.status,
+            comment: data.comment,
+          },
+          requireAuth: true,
+        }),
       "Status zostal zmieniony.",
     );
     return;
   }
 
   if (formId === "decision-form") {
-    mutate(
+    await mutateRemote(
       () =>
-        createDecision(
-          state,
-          data.caseId,
-          { type: data.type, justification: data.justification, final: true },
-          actorFor(ROLES.EMPLOYEE),
-        ),
+        apiRequest(`/api/cases/${encodeURIComponent(data.caseId)}/decision`, {
+          method: "POST",
+          body: {
+            type: data.type,
+            justification: data.justification,
+          },
+          requireAuth: true,
+        }),
       "Decyzja zostala zatwierdzona.",
     );
     return;
   }
 
   if (formId === "escalation-form") {
-    mutate(
-      () => escalateCase(state, data.caseId, data.reason, actorFor(ROLES.MANAGER)),
+    await mutateRemote(
+      () =>
+        apiRequest(`/api/cases/${encodeURIComponent(data.caseId)}/escalate`, {
+          method: "POST",
+          body: { reason: data.reason },
+          requireAuth: true,
+        }),
       "Zgloszenie zostalo eskalowane.",
     );
     return;
@@ -245,46 +377,48 @@ function handleSubmit(event) {
       status: data.status || "",
       category: data.category || "",
     };
-    setMessage("Raport zostal odswiezony.", "success");
-    render();
+    await loadReport();
     return;
   }
 
   if (formId === "config-form") {
-    mutate(
+    await mutateRemote(
       () =>
-        updateConfiguration(
-          state,
-          {
-            complaintDeadlineDays: data.complaintDeadlineDays,
-            returnDeadlineDays: data.returnDeadlineDays,
-            alertThresholdDays: data.alertThresholdDays,
-            staleEscalationDays: data.staleEscalationDays,
+        apiRequest("/api/config", {
+          method: "PUT",
+          body: {
+            complaintDeadlineDays: Number(data.complaintDeadlineDays),
+            returnDeadlineDays: Number(data.returnDeadlineDays),
+            alertThresholdDays: Number(data.alertThresholdDays),
+            staleEscalationDays: Number(data.staleEscalationDays),
           },
-          actorFor(ROLES.ADMIN),
-        ),
+          requireAuth: true,
+        }),
       "Konfiguracja zostala zapisana.",
     );
     return;
   }
 
   if (formId === "user-form") {
-    mutate(
+    const payload = {
+      name: data.name,
+      email: data.email,
+      role: data.role,
+      active: data.active === "on",
+    };
+    const editing = Boolean(data.id);
+    await mutateRemote(
       () =>
-        saveUser(
-          state,
-          {
-            id: data.id || undefined,
-            name: data.name,
-            email: data.email,
-            role: data.role,
-            active: data.active === "on",
-          },
-          actorFor(ROLES.ADMIN),
-        ),
-      data.id ? "Uzytkownik zostal zaktualizowany." : "Uzytkownik zostal dodany.",
+        apiRequest(editing ? `/api/users/${encodeURIComponent(data.id)}` : "/api/users", {
+          method: editing ? "PUT" : "POST",
+          body: payload,
+          requireAuth: true,
+        }),
+      editing ? "Uzytkownik zostal zaktualizowany." : "Uzytkownik zostal dodany.",
+      () => {
+        ui.editingUserId = null;
+      },
     );
-    ui.editingUserId = null;
   }
 }
 
@@ -292,7 +426,18 @@ function render() {
   ensureSelectedCase();
   renderSystemSummary();
   renderTabs();
+  renderSessionPanel();
   renderMessage();
+
+  if (ui.loading) {
+    main.innerHTML = `
+      <section class="panel">
+        ${emptyStateMarkup("Ladowanie danych z API...")}
+      </section>
+    `;
+    renderOperations();
+    return;
+  }
 
   const views = {
     client: renderClientView,
@@ -304,6 +449,58 @@ function render() {
 
   main.innerHTML = views[ui.activeTab]?.() || renderClientView();
   renderOperations();
+}
+
+function renderSessionPanel() {
+  if (!sessionPanel) return;
+
+  if (session.user) {
+    sessionPanel.innerHTML = `
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Sesja API</p>
+          <h2>${escapeHtml(session.user.name || session.user.email)}</h2>
+        </div>
+        <span class="counter">${escapeHtml(labelFor(session.user.role || ""))}</span>
+      </div>
+      <div class="compact-form">
+        <span class="muted">${escapeHtml(session.user.email || "")}</span>
+        <button type="button" class="button subtle" data-action="logout">Wyloguj</button>
+      </div>
+    `;
+    return;
+  }
+
+  sessionPanel.innerHTML = `
+    <div class="panel-heading">
+      <div>
+        <p class="eyebrow">Sesja API</p>
+        <h2>Logowanie demo</h2>
+      </div>
+    </div>
+    <form id="login-form" class="compact-form">
+      ${fieldInput("email", "E-mail", "marta.ops@example.com", true, "email")}
+      ${fieldInput("password", "Haslo", "demo123", true, "password")}
+      <button type="submit" class="button primary">Zaloguj</button>
+    </form>
+    <div class="compact-form compact-top">
+      ${demoAccounts
+        .map(
+          (account) => `
+            <button
+              type="button"
+              class="button subtle"
+              data-action="demo-login"
+              data-email="${escapeAttr(account.email)}"
+              data-password="${escapeAttr(account.password)}"
+            >
+              ${escapeHtml(account.label)}
+            </button>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
 }
 
 function renderClientView() {
@@ -342,7 +539,7 @@ function renderClientView() {
           </div>
         </div>
         <div class="data-list">
-          ${state.orders.map(renderOrderItem).join("")}
+          ${state.orders.map(renderOrderItem).join("") || emptyStateMarkup("Brak zamowien z API.")}
         </div>
       </section>
     </section>
@@ -395,12 +592,12 @@ function renderEmployeeView() {
           <button type="submit" class="button">Filtruj</button>
         </form>
         <div class="case-list" role="list">
-          ${cases.map(renderCaseListItem).join("") || emptyState("Brak spraw dla wybranych filtrow.")}
+          ${cases.map(renderCaseListItem).join("") || emptyStateMarkup("Brak spraw dla wybranych filtrow.")}
         </div>
       </aside>
 
       <section class="panel case-workspace">
-        ${selected ? renderCaseWorkspace(selected) : emptyState("Brak spraw do obslugi.")}
+        ${selected ? renderCaseWorkspace(selected) : emptyStateMarkup("Brak spraw do obslugi.")}
       </section>
     </section>
 
@@ -435,10 +632,10 @@ function renderManagerView() {
     (item) => item.status === STATUSES.ESCALATED || item.escalations.length > 0,
   );
   const atRisk = nonFinal.filter(
-    (item) => daysBetween(today, item.deadlineAt) <= state.config.alertThresholdDays,
+    (item) => daysBetween(today, item.deadlineAt) <= Number(state.config.alertThresholdDays || 0),
   );
   const overdue = nonFinal.filter((item) => daysBetween(today, item.deadlineAt) < 0);
-  const report = generateReport(state, cleanedFilters(ui.reportFilters));
+  const report = ui.report || emptyReport();
 
   return `
     <section class="view-grid">
@@ -464,7 +661,7 @@ function renderManagerView() {
           </div>
         </form>
         <div class="data-list">
-          ${escalated.map(renderEscalationItem).join("") || emptyState("Brak eskalacji.")}
+          ${escalated.map(renderEscalationItem).join("") || emptyStateMarkup("Brak eskalacji.")}
         </div>
       </section>
 
@@ -483,7 +680,7 @@ function renderManagerView() {
           ${fieldInput("category", "Kategoria", ui.reportFilters.category)}
           <button type="submit" class="button">Generuj</button>
         </form>
-        ${renderReport(report)}
+        ${ui.report ? renderReport(report) : emptyStateMarkup("Wybierz filtry i wygeneruj raport z API.")}
       </section>
     </section>
   `;
@@ -544,7 +741,7 @@ function renderAdminView() {
               </tr>
             </thead>
             <tbody>
-              ${state.users.map(renderUserRow).join("")}
+              ${state.users.map(renderUserRow).join("") || `<tr><td colspan="4">${emptyStateMarkup("Brak uzytkownikow z API.")}</td></tr>`}
             </tbody>
           </table>
         </div>
@@ -632,7 +829,7 @@ function renderCaseWorkspace(item) {
     <section class="case-section">
       <h3>Historia statusow</h3>
       <div class="timeline">
-        ${item.history.map(renderHistoryItem).join("")}
+        ${item.history.map(renderHistoryItem).join("") || emptyStateMarkup("Brak historii.")}
       </div>
     </section>
   `;
@@ -674,7 +871,7 @@ function renderLookupResult() {
     </dl>
     ${item.decision ? renderDecision(item.decision) : ""}
     <div class="timeline public-timeline">
-      ${item.history.map(renderHistoryItem).join("")}
+      ${item.history.map(renderHistoryItem).join("") || emptyStateMarkup("Brak historii publicznej.")}
     </div>
   `;
 }
@@ -697,7 +894,7 @@ function renderOperations() {
           </article>
         `,
       )
-      .join("") || emptyState("Brak powiadomien.");
+      .join("") || emptyStateMarkup("Brak powiadomien.");
 
   auditLog.innerHTML =
     state.auditLog
@@ -714,7 +911,7 @@ function renderOperations() {
           </article>
         `,
       )
-      .join("") || emptyState("Brak wpisow audytu.");
+      .join("") || emptyStateMarkup("Brak wpisow audytu.");
 }
 
 function renderSystemSummary() {
@@ -888,8 +1085,8 @@ function metricCard(label, value) {
   `;
 }
 
-function statusChip(status) {
-  return `<span class="status-chip status-${escapeAttr(status.toLowerCase())}">${escapeHtml(labelFor(status))}</span>`;
+function statusChip(status = STATUSES.NEW) {
+  return `<span class="status-chip status-${escapeAttr(String(status).toLowerCase())}">${escapeHtml(labelFor(status))}</span>`;
 }
 
 function fact(label, value) {
@@ -902,12 +1099,21 @@ function fact(label, value) {
 }
 
 function fieldInput(name, label, value = "", required = false, type = "text") {
+  const autocomplete = autocompleteFor(name, type);
   return `
     <label class="field">
       <span>${escapeHtml(label)}</span>
-      <input type="${escapeAttr(type)}" name="${escapeAttr(name)}" value="${escapeAttr(value)}" ${required ? "required" : ""} />
+      <input type="${escapeAttr(type)}" name="${escapeAttr(name)}" value="${escapeAttr(value)}" ${autocomplete ? `autocomplete="${escapeAttr(autocomplete)}"` : ""} ${required ? "required" : ""} />
     </label>
   `;
+}
+
+function autocompleteFor(name, type) {
+  if (type === "password") return "current-password";
+  if (type === "email") return "email";
+  if (type === "tel") return "tel";
+  if (name === "name") return "name";
+  return "";
 }
 
 function fieldSelect(name, label, options, selected = "", disabled = false) {
@@ -926,7 +1132,7 @@ function fieldSelect(name, label, options, selected = "", disabled = false) {
   `;
 }
 
-function emptyState(text) {
+function emptyStateMarkup(text) {
   return `<div class="empty-state"><p>${escapeHtml(text)}</p></div>`;
 }
 
@@ -992,61 +1198,418 @@ function ensureSelectedCase() {
   }
 }
 
-function mutate(operation, successMessage) {
+async function login(email, password) {
   try {
-    const result = operation();
-    state = result.state;
-    persistState();
-    setMessage(successMessage, "success");
+    const result = await apiRequest("/api/auth/login", {
+      method: "POST",
+      body: { email, password },
+      skipAuth: true,
+    });
+    session.token = result.token || "";
+    session.user = normalizeUser(result.user || {});
+    if (!session.token) {
+      throw new Error("API logowania nie zwrocilo tokenu.");
+    }
+    localStorage.setItem(TOKEN_KEY, session.token);
+    await refreshBootstrap({ silent: true });
+    setMessage(`Zalogowano jako ${session.user.name || session.user.email}.`, "success");
   } catch (error) {
-    setMessage(error.message || "Operacja nie powiodla sie.", "error");
+    clearSession();
+    setMessage(errorMessage(error), "error");
   }
   render();
 }
 
-function actorFor(role) {
-  const user = state.users.find((item) => item.role === role && item.active);
-  if (user) {
-    return {
-      id: user.id,
-      name: user.name,
-      role: user.role,
-    };
+async function loadCurrentUser() {
+  try {
+    const result = await apiRequest("/api/auth/me", { requireAuth: true });
+    session.user = normalizeUser(result.user || result);
+  } catch (error) {
+    clearSession();
+    setMessage(`Sesja wygasla lub jest nieprawidlowa. ${errorMessage(error)}`, "error");
   }
-  const fallback = {
-    [ROLES.CLIENT]: "Klient",
-    [ROLES.EMPLOYEE]: "Pracownik dyzurny",
-    [ROLES.MANAGER]: "Kierownik dyzurny",
-    [ROLES.ADMIN]: "Administrator",
+}
+
+async function refreshBootstrap(options = {}) {
+  const { silent = false } = options;
+  if (!silent) {
+    ui.loading = true;
+    render();
+  }
+
+  try {
+    const result = await apiRequest("/api/bootstrap", { skipAuth: true });
+    state = normalizeBootstrap(result);
+    ensureSelectedCase();
+  } catch (error) {
+    setMessage(errorMessage(error), "error");
+  } finally {
+    ui.loading = false;
+  }
+}
+
+async function loadCases(filters) {
+  try {
+    const result = await apiRequest(`/api/cases?${queryString(cleanedFilters(filters))}`, {
+      requireAuth: true,
+    });
+    state = {
+      ...state,
+      cases: extractArray(result, "cases").map(normalizeCase),
+    };
+    ensureSelectedCase();
+  } catch (error) {
+    setMessage(errorMessage(error), "error");
+  }
+}
+
+async function loadReport() {
+  try {
+    const result = await apiRequest(`/api/reports?${queryString(cleanedFilters(ui.reportFilters))}`, {
+      requireAuth: true,
+    });
+    ui.report = normalizeReport(result);
+    setMessage("Raport zostal odswiezony.", "success");
+  } catch (error) {
+    setMessage(errorMessage(error), "error");
+  }
+  render();
+}
+
+async function lookupPublicStatus(number, email) {
+  try {
+    const result = await apiRequest(
+      `/api/cases/status?${queryString({
+        number,
+        email,
+      })}`,
+      { skipAuth: true },
+    );
+    const found = extractCase(result);
+    ui.lookup = {
+      case: found ? normalizeCase(found) : null,
+      number,
+      email,
+    };
+    setMessage(found ? "Odnaleziono status zgloszenia." : "Status niedostepny dla podanych danych.", found ? "success" : "error");
+  } catch (error) {
+    ui.lookup = { case: null, number, email };
+    setMessage(errorMessage(error), "error");
+  }
+  render();
+}
+
+async function mutateRemote(operation, successMessage, afterSuccess) {
+  try {
+    const result = await operation();
+    if (afterSuccess) afterSuccess(result);
+    await refreshBootstrap({ silent: true });
+    setMessage(successMessage, "success");
+  } catch (error) {
+    setMessage(errorMessage(error), "error");
+  }
+  render();
+}
+
+async function apiRequest(path, options = {}) {
+  const {
+    method = "GET",
+    body,
+    requireAuth = false,
+    skipAuth = false,
+  } = options;
+
+  if (requireAuth && !session.token) {
+    throw new Error("Ta operacja wymaga zalogowania i odpowiedniej roli.");
+  }
+
+  const headers = {
+    Accept: "application/json",
   };
-  return { id: role.toLowerCase(), name: fallback[role], role };
+
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  if (!skipAuth && session.token) {
+    headers.Authorization = `Bearer ${session.token}`;
+  }
+
+  let response;
+  try {
+    response = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new Error("Nie mozna polaczyc sie z backendem API. Sprawdz, czy serwer jest uruchomiony.");
+  }
+
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(response, payload));
+  }
+  return payload;
+}
+
+async function readJson(response) {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { message: text };
+  }
+}
+
+function apiErrorMessage(response, payload) {
+  if (payload?.message) return payload.message;
+  if (payload?.error?.message) return payload.error.message;
+  if (typeof payload?.error === "string") return payload.error;
+  if (payload?.details) return Array.isArray(payload.details) ? payload.details.join(", ") : payload.details;
+  if (response.status === 401) return "Nie jestes zalogowany albo sesja wygasla.";
+  if (response.status === 403) return "Brak uprawnien do tej operacji.";
+  if (response.status === 404) return "Nie znaleziono zasobu w API.";
+  return `API zwrocilo blad ${response.status}.`;
+}
+
+function normalizeBootstrap(payload) {
+  const data = payload || {};
+  return {
+    config: normalizeConfig(data.config),
+    orders: extractArray(data, "orders").map(normalizeOrder),
+    cases: extractArray(data, "cases").map(normalizeCase),
+    notifications: extractArray(data, "notifications").map(normalizeNotification),
+    auditLog: extractArray(data, "auditLog").map(normalizeAuditEntry),
+    users: extractArray(data, "users").map(normalizeUser),
+    today: data.today || todayISO(),
+  };
+}
+
+function emptyBootstrap() {
+  return {
+    config: { ...DEFAULT_CONFIG },
+    orders: [],
+    cases: [],
+    notifications: [],
+    auditLog: [],
+    users: [],
+    today: new Date().toISOString().slice(0, 10),
+  };
+}
+
+function normalizeConfig(config = {}) {
+  return {
+    ...DEFAULT_CONFIG,
+    ...config,
+    complaintDeadlineDays: Number(config.complaintDeadlineDays ?? DEFAULT_CONFIG.complaintDeadlineDays),
+    returnDeadlineDays: Number(config.returnDeadlineDays ?? DEFAULT_CONFIG.returnDeadlineDays),
+    alertThresholdDays: Number(config.alertThresholdDays ?? DEFAULT_CONFIG.alertThresholdDays),
+    staleEscalationDays: Number(config.staleEscalationDays ?? DEFAULT_CONFIG.staleEscalationDays),
+  };
+}
+
+function normalizeOrder(order = {}) {
+  return {
+    number: order.number || order.orderNumber || "-",
+    customerName: order.customerName || order.customer?.name || "-",
+    email: order.email || order.customer?.email || "-",
+    phone: order.phone || order.customer?.phone || "",
+    product: order.product || order.productName || order.products?.[0]?.name || "-",
+    category: order.category || order.products?.[0]?.category || "-",
+    purchasedAt: order.purchasedAt || order.purchaseDate || "",
+  };
+}
+
+function normalizeCase(item = {}) {
+  const number = item.number || item.caseNumber || item.nr || "-";
+  const history = extractArray(item, "history").length
+    ? extractArray(item, "history")
+    : extractArray(item, "statusHistory");
+  return {
+    id: String(item.id || item.uuid || number),
+    number,
+    type: item.type || CASE_TYPES.COMPLAINT,
+    channel: item.channel || CHANNELS.ONLINE,
+    status: item.status || STATUSES.NEW,
+    priority: item.priority || "NORMALNY",
+    orderNumber: item.orderNumber || item.order?.number || "",
+    customerName: item.customerName || item.customer?.name || "-",
+    email: item.email || item.customer?.email || "",
+    phone: item.phone || item.customer?.phone || "",
+    product: item.product || item.productName || item.order?.product || item.order?.products?.[0]?.name || "-",
+    category: item.category || item.order?.category || item.order?.products?.[0]?.category || "-",
+    description: item.description || "",
+    reason: item.reason || "",
+    attachments: normalizeAttachments(item.attachments),
+    createdAt: item.createdAt || item.created_at || "",
+    deadlineAt: item.deadlineAt || item.deadline || item.termAt || "",
+    assignedTo: item.assignedTo || item.assignee?.name || null,
+    decision: item.decision ? normalizeDecision(item.decision) : null,
+    returnLabel: normalizeReturnLabel(item.returnLabel || item.returnShipment || item.shipment),
+    history: history.map(normalizeHistoryItem),
+    escalations: extractArray(item, "escalations").map(normalizeEscalation),
+  };
+}
+
+function normalizeDecision(decision = {}) {
+  return {
+    id: String(decision.id || ""),
+    type: decision.type || DECISION_TYPES.REPAIR,
+    justification: decision.justification || "",
+    author: decision.author || decision.authorName || decision.user?.name || "-",
+    createdAt: decision.createdAt || decision.approvedAt || decision.created_at || "",
+    final: Boolean(decision.final ?? decision.approvedAt ?? true),
+  };
+}
+
+function normalizeReturnLabel(label) {
+  if (!label) return null;
+  return {
+    id: String(label.id || ""),
+    courier: label.courier || label.carrier || "-",
+    trackingNumber: label.trackingNumber || label.tracking || "-",
+    format: label.format || "PDF",
+    generatedAt: label.generatedAt || label.createdAt || "",
+  };
+}
+
+function normalizeHistoryItem(item = {}) {
+  return {
+    status: item.status || item.newStatus || STATUSES.NEW,
+    actor: item.actor || item.actorName || item.user?.name || "System",
+    comment: item.comment || item.details || "",
+    createdAt: item.createdAt || item.changedAt || item.created_at || "",
+  };
+}
+
+function normalizeEscalation(item = {}) {
+  return {
+    id: String(item.id || ""),
+    reason: item.reason || item.comment || "Eskalacja",
+    author: item.author || item.actor || item.user?.name || "System",
+    createdAt: item.createdAt || item.created_at || "",
+  };
+}
+
+function normalizeNotification(item = {}) {
+  return {
+    id: String(item.id || ""),
+    type: item.type || item.trigger || item.channel || "INFO",
+    caseNumber: item.caseNumber || item.number || item.case?.number || "-",
+    body: item.body || item.message || item.payload || "",
+    recipient: item.recipient || item.email || item.phone || "-",
+    createdAt: item.createdAt || item.created_at || "",
+  };
+}
+
+function normalizeAuditEntry(item = {}) {
+  return {
+    id: String(item.id || ""),
+    action: item.action || item.event || "AUDIT",
+    actor: item.actor || item.actorName || item.user?.name || "System",
+    details: item.details || item.message || item.description || "",
+    createdAt: item.createdAt || item.created_at || "",
+  };
+}
+
+function normalizeUser(user = {}) {
+  return {
+    id: String(user.id || user.uuid || user.email || ""),
+    name: user.name || user.fullName || user.email || "-",
+    email: user.email || "",
+    role: user.role || ROLES.CLIENT,
+    active: Boolean(user.active ?? user.enabled ?? true),
+  };
+}
+
+function normalizeReport(report = {}) {
+  const source = report.report || report.data?.report || report;
+  return {
+    total: Number(source.total ?? source.summary?.total ?? 0),
+    acceptedPercent: Number(source.acceptedPercent ?? source.summary?.acceptedPercent ?? 0),
+    rejectedPercent: Number(source.rejectedPercent ?? source.summary?.rejectedPercent ?? 0),
+    averageResolutionDays: Number(source.averageResolutionDays ?? source.summary?.averageResolutionDays ?? 0),
+    topReasons: extractArray(source, "topReasons").map((item) => ({
+      reason: item.reason || item.name || "-",
+      count: Number(item.count || 0),
+    })),
+    byStatus: source.byStatus || source.statuses || {},
+    byType: source.byType || source.types || {},
+  };
+}
+
+function emptyReport() {
+  return {
+    total: 0,
+    acceptedPercent: 0,
+    rejectedPercent: 0,
+    averageResolutionDays: 0,
+    topReasons: [],
+    byStatus: {},
+    byType: {},
+  };
+}
+
+function extractArray(payload, key) {
+  const value = payload?.[key];
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(payload?.data?.[key])) return payload.data[key];
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload)) return payload;
+  return [];
+}
+
+function extractCase(payload) {
+  if (!payload) return null;
+  if (payload.case) return payload.case;
+  if (payload.zgloszenie) return payload.zgloszenie;
+  if (payload.data?.case) return payload.data.case;
+  if (payload.data?.zgloszenie) return payload.data.zgloszenie;
+  if (payload.id || payload.number || payload.caseNumber) return payload;
+  return null;
+}
+
+function normalizeAttachments(attachments) {
+  if (Array.isArray(attachments)) {
+    return attachments.map((item) => (typeof item === "string" ? item : item.name || item.filename || "")).filter(Boolean);
+  }
+  return String(attachments || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function casePayload(data) {
+  return {
+    type: data.type,
+    channel: data.channel || CHANNELS.ONLINE,
+    orderNumber: data.orderNumber,
+    email: data.email,
+    phone: data.phone,
+    reason: data.reason,
+    description: data.description,
+    attachments: normalizeAttachments(data.attachments),
+  };
+}
+
+function clearSession() {
+  session.token = "";
+  session.user = null;
+  localStorage.removeItem(TOKEN_KEY);
 }
 
 function cleanedFilters(filters) {
   return Object.fromEntries(Object.entries(filters).filter(([, value]) => value));
 }
 
+function queryString(params) {
+  return new URLSearchParams(cleanedFilters(params)).toString();
+}
+
 function formData(form) {
   return Object.fromEntries(new FormData(form).entries());
-}
-
-function loadState() {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      if (parsed?.config && Array.isArray(parsed.cases) && Array.isArray(parsed.users)) {
-        return parsed;
-      }
-    }
-  } catch {
-    localStorage.removeItem(STORAGE_KEY);
-  }
-  return createDemoState();
-}
-
-function persistState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
 function setMessage(text, type = "success") {
@@ -1057,15 +1620,20 @@ function clearMessage() {
   ui.message = null;
 }
 
+function errorMessage(error) {
+  return error?.message || "Operacja nie powiodla sie.";
+}
+
 function labelFor(value) {
   return labels[value] || value;
 }
 
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  return state.today || new Date().toISOString().slice(0, 10);
 }
 
 function daysBetween(fromISO, toISO) {
+  if (!fromISO || !toISO) return 0;
   const from = new Date(`${fromISO}T00:00:00.000Z`);
   const to = new Date(`${toISO}T00:00:00.000Z`);
   return Math.round((to - from) / 86400000);

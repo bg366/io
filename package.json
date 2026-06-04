@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test && python3 -m unittest discover -s test -p '*_test.py'",
+    "test:api": "python3 -m unittest discover -s test -p '*_test.py'",
+    "test:frontend": "node --test"
   }
 }
