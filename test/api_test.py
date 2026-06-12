@@ -41,15 +41,15 @@ class ApiTest(unittest.TestCase):
         env["SZRZ_DB"] = cls.db_path
         env["PORT"] = str(cls.port)
         env["SZRZ_PORT"] = str(cls.port)
+        env["SZRZ_QUIET"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
 
         cls.server = subprocess.Popen(
             [sys.executable, "server.py"],
             cwd=ROOT,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         cls.wait_for_server()
 
@@ -73,8 +73,9 @@ class ApiTest(unittest.TestCase):
         last_error = None
         while time.time() < deadline:
             if cls.server.poll() is not None:
-                output = cls.server.stdout.read() if cls.server.stdout else ""
-                raise AssertionError("server.py exited during startup:\n" + output)
+                raise AssertionError(
+                    f"server.py exited during startup with code {cls.server.returncode}"
+                )
             try:
                 conn = http.client.HTTPConnection(HOST, cls.port, timeout=1)
                 conn.request("GET", "/api/bootstrap")
@@ -124,11 +125,12 @@ class ApiTest(unittest.TestCase):
         return response.status, data
 
     def reset_demo(self):
-        status, _ = self.request("POST", "/api/reset-demo")
-        if status in (401, 403):
-            self.request("POST", "/api/reset-demo", token=self.login(ADMIN_EMAIL), expected=(200, 204))
-        else:
-            self.assertIn(status, (200, 204))
+        self.request(
+            "POST",
+            "/api/reset-demo",
+            token=self.login(ADMIN_EMAIL),
+            expected=(200, 204),
+        )
 
     def login(self, email=EMPLOYEE_EMAIL, password=DEMO_PASSWORD):
         _, data = self.request(
