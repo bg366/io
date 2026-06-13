@@ -2,6 +2,7 @@ import http.client
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -169,6 +170,13 @@ class ApiTest(unittest.TestCase):
             return data
         return {}
 
+    def db_value(self, sql, params=()):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(sql, params).fetchone()[0]
+        finally:
+            conn.close()
+
     def create_case(self, case_type="REKLAMACJA", email="piotr.zielinski@example.com"):
         payload = {
             "type": case_type,
@@ -250,6 +258,48 @@ class ApiTest(unittest.TestCase):
         persisted = self.case_by_id(created["id"])
         self.assertEqual(persisted.get("number"), created["number"])
 
+    def test_portal_and_employee_registration_preserve_channels_and_assignment(self):
+        employee_token = self.login(EMPLOYEE_EMAIL)
+
+        _, portal_data = self.request(
+            "POST",
+            "/api/cases",
+            {
+                "type": "REKLAMACJA",
+                "channel": "ONLINE",
+                "orderNumber": "ORD-2026-1003",
+                "email": "piotr.zielinski@example.com",
+                "phone": "+48600600600",
+                "description": "Portal registration test case.",
+                "reason": "Portal test",
+                "attachments": ["portal.png"],
+            },
+            expected=(200, 201),
+        )
+        portal_case = self.object_from(portal_data, "case")
+        self.assertEqual(portal_case.get("channel"), "ONLINE")
+        self.assertIsNone(portal_case.get("assignedTo"))
+
+        _, employee_data = self.request(
+            "POST",
+            "/api/cases",
+            {
+                "type": "ZWROT",
+                "channel": "TELEFON",
+                "orderNumber": "ORD-2026-1002",
+                "email": "anna.nowak@example.com",
+                "phone": "+48500500500",
+                "description": "Employee registration test case.",
+                "reason": "Employee assisted return",
+                "attachments": [],
+            },
+            token=employee_token,
+            expected=(200, 201),
+        )
+        employee_case = self.object_from(employee_data, "case")
+        self.assertEqual(employee_case.get("channel"), "TELEFON")
+        self.assertEqual(employee_case.get("assignedTo"), "Marta Lewandowska")
+
     def test_public_status_lookup_works(self):
         created = self.create_case("REKLAMACJA")
 
@@ -294,6 +344,85 @@ class ApiTest(unittest.TestCase):
             ),
             notifications,
         )
+
+    def test_full_return_status_cycle_reaches_closed_state(self):
+        token = self.login(EMPLOYEE_EMAIL)
+        created = self.create_case("ZWROT")
+
+        self.request(
+            "PUT",
+            f"/api/cases/{created['id']}/status",
+            {"status": "W_TRAKCIE", "comment": "Accepted for return handling."},
+            token=token,
+            expected=200,
+        )
+        self.request(
+            "POST",
+            f"/api/cases/{created['id']}/return-label",
+            {"courier": "InPost"},
+            token=token,
+            expected=(200, 201),
+        )
+        self.request(
+            "POST",
+            f"/api/cases/{created['id']}/wms-receipt",
+            {"condition": "Towar kompletny"},
+            token=token,
+            expected=200,
+        )
+        self.request(
+            "POST",
+            f"/api/cases/{created['id']}/decision",
+            {"type": "ZWROT_GOTOWKI", "justification": "Return accepted after warehouse receipt."},
+            token=token,
+            expected=(200, 201),
+        )
+        _, closed_data = self.request(
+            "PUT",
+            f"/api/cases/{created['id']}/status",
+            {"status": "ZAMKNIETE", "comment": "Case archived after final decision."},
+            token=token,
+            expected=200,
+        )
+        closed = self.object_from(closed_data, "case")
+        history_statuses = [entry.get("status") for entry in closed.get("history", [])]
+
+        self.assertEqual(closed.get("status"), "ZAMKNIETE")
+        for status in ("NOWE", "W_TRAKCIE", "OCZEKUJE_NA_TOWAR", "ROZPATRZONE", "ZAMKNIETE"):
+            self.assertIn(status, history_statuses)
+
+    def test_status_and_decision_notifications_include_email_sms_delivery_metadata(self):
+        token = self.login(EMPLOYEE_EMAIL)
+        created = self.create_case("REKLAMACJA")
+
+        self.request(
+            "PUT",
+            f"/api/cases/{created['id']}/status",
+            {"status": "W_TRAKCIE", "comment": "Notification metadata test."},
+            token=token,
+            expected=200,
+        )
+        self.request(
+            "POST",
+            f"/api/cases/{created['id']}/decision",
+            {"type": "NAPRAWA", "justification": "Repair approved."},
+            token=token,
+            expected=(200, 201),
+        )
+
+        _, notifications_data = self.request("GET", "/api/notifications", token=token, expected=200)
+        notifications = self.list_from(notifications_data, "notifications")
+        case_notifications = [
+            item for item in notifications if item.get("caseNumber") == created["number"]
+        ]
+        notification_types = {item.get("type") for item in case_notifications}
+
+        self.assertTrue({"POTWIERDZENIE", "STATUS", "DECYZJA"}.issubset(notification_types))
+        self.assertTrue(case_notifications, notifications)
+        for item in case_notifications:
+            self.assertEqual(item.get("recipient"), "piotr.zielinski@example.com")
+            self.assertEqual(item.get("channel"), "EMAIL/SMS")
+            self.assertLessEqual(item.get("deliveredWithinSeconds"), 60)
 
     def test_rejection_decision_requires_justification_and_decision_is_immutable(self):
         token = self.login(EMPLOYEE_EMAIL)
@@ -421,6 +550,84 @@ class ApiTest(unittest.TestCase):
         self.assertGreaterEqual(report.get("byStatus", {}).get("ROZPATRZONE", 0), 1)
         self.assertIn("acceptedPercent", report)
         self.assertIn("topReasons", report)
+
+    def test_report_filters_match_database_counts_for_selected_period(self):
+        token = self.login(EMPLOYEE_EMAIL)
+        manager_token = self.login(MANAGER_EMAIL)
+        created = self.create_case("REKLAMACJA")
+        self.request(
+            "POST",
+            f"/api/cases/{created['id']}/decision",
+            {"type": "ZWROT_GOTOWKI", "justification": "Accepted for reporting filter test."},
+            token=token,
+            expected=(200, 201),
+        )
+
+        from_date = "2000-01-01"
+        to_date = "2099-12-31"
+        expected_total = self.db_value(
+            "SELECT COUNT(*) FROM cases WHERE created_at >= ? AND created_at <= ? AND type = ?",
+            (from_date, to_date, "REKLAMACJA"),
+        )
+        expected_decided = self.db_value(
+            """
+            SELECT COUNT(*)
+            FROM cases
+            WHERE created_at >= ? AND created_at <= ? AND type = ? AND status = ?
+            """,
+            (from_date, to_date, "REKLAMACJA", "ROZPATRZONE"),
+        )
+
+        _, data = self.request(
+            "GET",
+            f"/api/reports?from={from_date}&to={to_date}&type=REKLAMACJA",
+            token=manager_token,
+            expected=200,
+        )
+        report = self.object_from(data, "report")
+        self.assertEqual(report.get("total"), expected_total)
+        self.assertEqual(report.get("byType", {}).get("REKLAMACJA"), expected_total)
+        self.assertEqual(report.get("byStatus", {}).get("ROZPATRZONE", 0), expected_decided)
+
+        _, empty_data = self.request(
+            "GET",
+            "/api/reports?from=2099-01-01&to=2099-12-31",
+            token=manager_token,
+            expected=200,
+        )
+        empty_report = self.object_from(empty_data, "report")
+        self.assertEqual(empty_report.get("total"), 0)
+
+    def test_rbac_denies_lower_roles_and_allows_admin_operations(self):
+        client_token = self.login("client@example.com")
+        employee_token = self.login(EMPLOYEE_EMAIL)
+        admin_token = self.login(ADMIN_EMAIL)
+        created = self.create_case("REKLAMACJA")
+
+        self.request("GET", "/api/cases", token=client_token, expected=403)
+        self.request(
+            "PUT",
+            f"/api/cases/{created['id']}/status",
+            {"status": "W_TRAKCIE", "comment": "Client must not update status."},
+            token=client_token,
+            expected=403,
+        )
+        self.request("GET", "/api/reports", token=employee_token, expected=403)
+        self.request("GET", "/api/users", token=employee_token, expected=403)
+
+        _, status_data = self.request(
+            "PUT",
+            f"/api/cases/{created['id']}/status",
+            {"status": "W_TRAKCIE", "comment": "Admin can operate case workflow."},
+            token=admin_token,
+            expected=200,
+        )
+        updated = self.object_from(status_data, "case")
+        self.assertEqual(updated.get("status"), "W_TRAKCIE")
+
+        _, users_data = self.request("GET", "/api/users", token=admin_token, expected=200)
+        users = self.list_from(users_data, "users")
+        self.assertTrue(any(user.get("role") == "ADMINISTRATOR" for user in users), users)
 
     def test_admin_config_update_and_user_create_toggle_are_audited(self):
         token = self.login(ADMIN_EMAIL)
