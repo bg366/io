@@ -80,9 +80,11 @@ export function renderUserRow(user) {
       </td>
       <td>${escapeHtml(labelFor(user.role))}</td>
       <td>${user.active ? "Aktywny" : "Nieaktywny"}</td>
-      <td class="table-actions">
-        <button type="button" class="button subtle" data-action="edit-user" data-user-id="${escapeAttr(user.id)}">Edytuj</button>
-        <button type="button" class="button subtle" data-action="toggle-user" data-user-id="${escapeAttr(user.id)}">${user.active ? "Dezaktywuj" : "Aktywuj"}</button>
+      <td>
+        <div class="table-actions">
+          <button type="button" class="button subtle" data-action="edit-user" data-user-id="${escapeAttr(user.id)}">Edytuj</button>
+          <button type="button" class="button subtle" data-action="toggle-user" data-user-id="${escapeAttr(user.id)}">${user.active ? "Dezaktywuj" : "Aktywuj"}</button>
+        </div>
       </td>
     </tr>
   `;

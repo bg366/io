@@ -264,7 +264,7 @@ export function renderAdminView() {
   const editing = state.users.find((item) => item.id === ui.editingUserId);
 
   return `
-    <section class="view-grid">
+    <section class="admin-layout">
       <section class="panel">
         <div class="panel-heading">
           <div>
@@ -305,7 +305,13 @@ export function renderAdminView() {
           </div>
         </form>
         <div class="table-wrap">
-          <table>
+          <table class="users-table">
+            <colgroup>
+              <col class="col-name" />
+              <col class="col-role" />
+              <col class="col-status" />
+              <col class="col-actions" />
+            </colgroup>
             <thead>
               <tr>
                 <th>Nazwa</th>
